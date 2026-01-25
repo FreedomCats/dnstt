@@ -3,7 +3,7 @@
 // Usage:
 //
 //	dnstt-server -gen-key [-privkey-file PRIVKEYFILE] [-pubkey-file PUBKEYFILE]
-//	dnstt-server -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] DOMAIN UPSTREAMADDR
+//	dnstt-server -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] UPSTREAMADDR
 //
 // Example:
 //
@@ -30,9 +30,6 @@
 // Queries that do not advertise requester support for responses of at least
 // this size at least this size will be responded to with a FORMERR. The default
 // value is maxUDPPayload.
-//
-// DOMAIN is the root of the DNS zone reserved for the tunnel. See README for
-// instructions on setting it up.
 //
 // UPSTREAMADDR is the TCP address to which incoming tunnelled streams will be
 // forwarded.
@@ -351,12 +348,31 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 	}
 }
 
+// Return the longest possible possible payload that is base32-decodable from
+// name. For every non-empty prefix of name, from longest to shortest, try
+// base32 decoding, and return the decoded payload if decoding was successful.
+func maximalPayload(name dns.Name) ([]byte, error) {
+	var err error
+	for prefixLen := len(name); prefixLen >= 1; prefixLen-- {
+		prefix := name[:prefixLen]
+		encoded := bytes.ToUpper(bytes.Join(prefix, nil))
+		payload := make([]byte, base32Encoding.DecodedLen(len(encoded)))
+		var n int
+		n, err = base32Encoding.Decode(payload, encoded)
+		if err == nil {
+			return payload[:n], nil
+		}
+	}
+	// Base32 error for every prefixLen, return the last one.
+	return nil, err
+}
+
 // responseFor constructs a response dns.Message that is appropriate for query.
 // Along with the dns.Message, it returns the query's decoded data payload. If
 // the returned dns.Message is nil, it means that there should be no response to
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
 // the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
+func responseFor(query *dns.Message) (*dns.Message, []byte) {
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000, // QR = 1, RCODE = no error
@@ -426,17 +442,6 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		return resp, nil
 	}
 	question := query.Question[0]
-	// Check the name to see if it ends in our chosen domain, and extract
-	// all that comes before the domain if it does. If it does not, we will
-	// return RcodeNameError below, but prefer to return RcodeFormatError
-	// for payload size if that applies as well.
-	prefix, ok := question.Name.TrimSuffix(domain)
-	if !ok {
-		// Not a name we are authoritative for.
-		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: not authoritative for %s", question.Name)
-		return resp, nil
-	}
 	resp.Flags |= 0x0400 // AA = 1
 
 	if query.Opcode() != 0 {
@@ -457,16 +462,23 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		return resp, nil
 	}
 
-	encoded := bytes.ToUpper(bytes.Join(prefix, nil))
-	payload := make([]byte, base32Encoding.DecodedLen(len(encoded)))
-	n, err := base32Encoding.Decode(payload, encoded)
+	// We may answer for any domain suffix, but we don't know, a priori, how
+	// many of the name's labels are the payload-carrying prefix, and how
+	// many are the suffix (e.g. "t.example.com"). maximalPayload returns
+	// the longest payload decodable from the name. The payload may
+	// erroneously contain parts of what is properly considered the suffix,
+	// but that's not a problem because of the way packets are decoded from
+	// payloads from beginning to end (in nextPacket). Any extra bytes at
+	// the end will either be interpreted as having an inconsistent length
+	// prefix, or simply as a short junk packet, and will be discarded.
+	payload, err := maximalPayload(question.Name)
 	if err != nil {
-		// Base32 error, make like the name doesn't exist.
+		// Impossible to Base32 decode any prefix, make like the name
+		// doesn't exist.
 		resp.Flags |= dns.RcodeNameError
 		log.Printf("NXDOMAIN: base32 decoding: %v", err)
 		return resp, nil
 	}
-	payload = payload[:n]
 
 	// We require clients to support EDNS(0) with a minimum payload size;
 	// otherwise we would have to set a small KCP MTU (only around 200
@@ -498,7 +510,7 @@ type record struct {
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record) error {
+func recvLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -517,7 +529,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			continue
 		}
 
-		resp, payload := responseFor(&query, domain)
+		resp, payload := responseFor(&query)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
@@ -732,7 +744,7 @@ func computeMaxEncodedPayload(limit int) int {
 			},
 		},
 	}
-	resp, _ := responseFor(query, dns.Name([][]byte{}))
+	resp, _ := responseFor(query)
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{
@@ -765,7 +777,7 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn) error {
+func run(privkey []byte, upstream string, dnsConn net.PacketConn) error {
 	defer dnsConn.Close()
 
 	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -815,7 +827,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}()
 
-	return recvLoop(domain, dnsConn, ttConn, ch)
+	return recvLoop(dnsConn, ttConn, ch)
 }
 
 func main() {
@@ -828,11 +840,11 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
   %[1]s -gen-key -privkey-file PRIVKEYFILE -pubkey-file PUBKEYFILE
-  %[1]s -udp ADDR -privkey-file PRIVKEYFILE DOMAIN UPSTREAMADDR
+  %[1]s -udp ADDR -privkey-file PRIVKEYFILE UPSTREAMADDR
 
 Example:
   %[1]s -gen-key -privkey-file server.key -pubkey-file server.pub
-  %[1]s -udp :53 -privkey-file server.key t.example.com 127.0.0.1:8000
+  %[1]s -udp :53 -privkey-file server.key 127.0.0.1:8000
 
 `, os.Args[0])
 		flag.PrintDefaults()
@@ -859,16 +871,11 @@ Example:
 		}
 	} else {
 		// Ordinary server mode.
-		if flag.NArg() != 2 {
+		if flag.NArg() != 1 {
 			flag.Usage()
 			os.Exit(1)
 		}
-		domain, err := dns.ParseName(flag.Arg(0))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", flag.Arg(0), err)
-			os.Exit(1)
-		}
-		upstream := flag.Arg(1)
+		upstream := flag.Arg(0)
 		// We keep upstream as a string in order to eventually pass it
 		// to net.Dial in handleStream. But for the sake of displaying
 		// an error or warning at startup, rather than only when the
@@ -943,7 +950,7 @@ Example:
 			}
 		}
 
-		err = run(privkey, domain, upstream, dnsConn)
+		err = run(privkey, upstream, dnsConn)
 		if err != nil {
 			log.Fatal(err)
 		}
