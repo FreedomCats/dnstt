@@ -95,9 +95,6 @@ var (
 	maxUDPPayload = 1280 - 40 - 8
 )
 
-// base32Encoding is a base32 encoding without padding.
-var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
-
 // generateKeypair generates a private key and the corresponding public key. If
 // privkeyFilename and pubkeyFilename are respectively empty, it prints the
 // corresponding key to standard output; otherwise it saves the key to the given
@@ -348,17 +345,31 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 	}
 }
 
+// Join the labels of name, convert them to uppercase, and add base32 padding
+// in preparation for base32 decoding.
+func joinToBase32(name dns.Name) []byte {
+	encoded := bytes.ToUpper(bytes.Join(name, nil))
+	// Add base32 padding to a multiple of 8.
+	numPadding := (-len(encoded)) & 0b111
+	return append(encoded, []byte("========"[:numPadding])...)
+}
+
 // Return the longest possible possible payload that is base32-decodable from
 // name. For every non-empty prefix of name, from longest to shortest, try
 // base32 decoding, and return the decoded payload if decoding was successful.
 func maximalPayload(name dns.Name) ([]byte, error) {
 	var err error
 	for prefixLen := len(name); prefixLen >= 1; prefixLen-- {
-		prefix := name[:prefixLen]
-		encoded := bytes.ToUpper(bytes.Join(prefix, nil))
-		payload := make([]byte, base32Encoding.DecodedLen(len(encoded)))
+		encoded := joinToBase32(name[:prefixLen])
+		// We use base32.StdEncoding and add our own padding, rather
+		// than WithPadding(NoPadding), because the latter may silently
+		// return a truncated buffer when the input length is unexpected
+		// (as is likely to happen with how we are hunting for the end
+		// of the payload).
+		// https://github.com/golang/go/issues/77493
+		payload := make([]byte, base32.StdEncoding.DecodedLen(len(encoded)))
 		var n int
-		n, err = base32Encoding.Decode(payload, encoded)
+		n, err = base32.StdEncoding.Decode(payload, encoded)
 		if err == nil {
 			return payload[:n], nil
 		}
